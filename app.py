@@ -190,8 +190,6 @@ def build_network_graph(design: NetworkDesignResult, server_label: str) -> Digra
     """
     dot = Digraph(comment=f"{design.name} network")
     dot.attr(rankdir="TB", splines="polyline")
-
-    # Use box shapes for clarity
     dot.attr("node", shape="box")
 
     previous_node = None
@@ -238,6 +236,47 @@ def build_network_graph(design: NetworkDesignResult, server_label: str) -> Digra
         dot.edge(previous_node, server_node)
 
     return dot
+
+
+def racks_needed_for_nodes(
+    num_nodes: int,
+    node_u: int,
+    node_power_kw: float,
+    rack_profile: RackProfile,
+    rack_power_kw: float,
+) -> tuple[int, int, int, int]:
+    """
+    Compute how many racks are required for a homogeneous set of nodes,
+    constrained by both:
+
+    - Space: rack_profile.rack_units / node_u
+    - Power: rack_power_kw / node_power_kw
+
+    Returns:
+        racks_needed, nodes_per_rack, cap_by_u, cap_by_power
+    """
+    if num_nodes == 0:
+        return 0, 0, 0, 0
+
+    # Capacity by rack units
+    cap_by_u = rack_profile.rack_units // node_u if node_u > 0 else 0
+
+    # Capacity by rack power
+    if node_power_kw > 0:
+        cap_by_power = int(rack_power_kw // node_power_kw)
+    else:
+        cap_by_power = cap_by_u
+
+    if cap_by_u <= 0 or cap_by_power <= 0:
+        # Cannot fit even one node per rack without violating U or power
+        nodes_per_rack = 0
+        racks_needed = num_nodes  # conceptually one rack per node but invalid
+        return racks_needed, nodes_per_rack, cap_by_u, cap_by_power
+
+    nodes_per_rack = min(cap_by_u, cap_by_power)
+    racks_needed = ceil_div(num_nodes, nodes_per_rack)
+
+    return racks_needed, nodes_per_rack, cap_by_u, cap_by_power
 
 
 # ------------------------------
@@ -328,6 +367,13 @@ max_racks = st.sidebar.number_input(
     step=1,
 )
 
+max_rack_power_kw = st.sidebar.number_input(
+    "Maximum rack power (kW)",
+    min_value=1.0,
+    value=51.0,
+    step=1.0,
+)
+
 # Rack profile
 st.sidebar.subheader("Rack configuration")
 
@@ -410,7 +456,7 @@ with st.sidebar.expander("Backside network (GPU fabric)", expanded=True):
     backside_topology = st.selectbox(
         "Topology (backside)",
         options=topology_options,
-        index=2,  # default Fat Tree
+        index=0,  # default Rail
         key="backside_topology",
     )
     backside_tiers = st.select_slider(
@@ -429,21 +475,21 @@ with st.sidebar.expander("Backside network (GPU fabric)", expanded=True):
     backside_leaf_ports = st.number_input(
         "Leaf switch ports (backside)",
         min_value=8,
-        value=64,
+        value=128,
         step=1,
         key="backside_leaf_ports",
     )
     backside_spine_ports = st.number_input(
         "Spine switch ports (backside)",
         min_value=8,
-        value=64,
+        value=128,
         step=1,
         key="backside_spine_ports",
     )
     backside_core_ports = st.number_input(
         "Core switch ports (backside)",
         min_value=8,
-        value=64,
+        value=128,
         step=1,
         key="backside_core_ports",
     )
@@ -458,13 +504,13 @@ with st.sidebar.expander("Frontside network (GPU ↔ storage)", expanded=False):
     frontside_tiers = st.select_slider(
         "Number of switch tiers",
         options=[1, 2, 3],
-        value=2,
+        value=1,
         key="frontside_tiers",
     )
     frontside_oversub = st.number_input(
         "Oversubscription ratio (server:uplink)",
         min_value=1.0,
-        value=2.0,
+        value=1.0,
         step=0.5,
         key="frontside_oversub",
     )
@@ -485,7 +531,7 @@ with st.sidebar.expander("Frontside network (GPU ↔ storage)", expanded=False):
     frontside_core_ports = st.number_input(
         "Core switch ports (frontside)",
         min_value=8,
-        value=64,
+        value=128,
         step=1,
         key="frontside_core_ports",
     )
@@ -513,14 +559,14 @@ with st.sidebar.expander("Management network (out-of-band)", expanded=False):
     mgmt_leaf_ports = st.number_input(
         "Leaf switch ports (management)",
         min_value=8,
-        value=48,
+        value=64,
         step=1,
         key="mgmt_leaf_ports",
     )
     mgmt_spine_ports = st.number_input(
         "Spine switch ports (management)",
         min_value=8,
-        value=48,
+        value=64,
         step=1,
         key="mgmt_spine_ports",
     )
@@ -536,7 +582,7 @@ with st.sidebar.expander("Management network (out-of-band)", expanded=False):
 # Calculations
 # ------------------------------
 
-# Power calculations
+# Power calculations (per-node)
 gpu_node_power_kw = GPUS_PER_NODE * GPU_POWER_KW + extra_gpu_node_power_kw
 total_gpu_power_kw = num_gpu_nodes * gpu_node_power_kw
 total_storage_power_kw = num_storage_nodes * storage_node_power_kw
@@ -592,6 +638,7 @@ total_switches = (
 
 total_switch_power_kw = total_switches * switch_power_kw
 
+# Total IT power (includes GPUs, nodes, storage, mgmt, NICs implicitly, and switches)
 total_it_power_kw = (
     total_gpu_power_kw
     + total_storage_power_kw
@@ -599,16 +646,41 @@ total_it_power_kw = (
     + total_switch_power_kw
 )
 
-# Rack counts, separate racks for GPU / storage / mgmt, plus network racks
-gpu_racks = ceil_div(num_gpu_nodes * rack_profile.gpu_node_u, rack_profile.rack_units)
-storage_racks = ceil_div(
-    num_storage_nodes * rack_profile.storage_node_u, rack_profile.rack_units
+# Rack counts using both power and U constraints
+gpu_racks, gpu_nodes_per_rack, gpu_cap_by_u, gpu_cap_by_pwr = racks_needed_for_nodes(
+    num_gpu_nodes,
+    rack_profile.gpu_node_u,
+    gpu_node_power_kw,
+    rack_profile,
+    max_rack_power_kw,
 )
-mgmt_racks = ceil_div(
-    num_mgmt_nodes * rack_profile.mgmt_node_u, rack_profile.rack_units
+
+storage_racks, storage_nodes_per_rack, storage_cap_by_u, storage_cap_by_pwr = (
+    racks_needed_for_nodes(
+        num_storage_nodes,
+        rack_profile.storage_node_u,
+        storage_node_power_kw,
+        rack_profile,
+        max_rack_power_kw,
+    )
 )
-network_racks = ceil_div(
-    total_switches * rack_profile.switch_u, rack_profile.rack_units
+
+mgmt_racks, mgmt_nodes_per_rack, mgmt_cap_by_u, mgmt_cap_by_pwr = (
+    racks_needed_for_nodes(
+        num_mgmt_nodes,
+        rack_profile.mgmt_node_u,
+        mgmt_node_power_kw,
+        rack_profile,
+        max_rack_power_kw,
+    )
+)
+
+network_racks, switches_per_rack, sw_cap_by_u, sw_cap_by_pwr = racks_needed_for_nodes(
+    total_switches,
+    rack_profile.switch_u,
+    switch_power_kw,
+    rack_profile,
+    max_rack_power_kw,
 )
 
 total_racks = gpu_racks + storage_racks + mgmt_racks + network_racks
@@ -628,11 +700,11 @@ with col1:
     )
     if total_it_power_kw <= max_it_power_kw:
         st.success(
-            f"Within datacenter power limit (≤ {max_it_power_kw:.1f} kW)."
+            f"Within datacenter IT power limit (≤ {max_it_power_kw:.1f} kW)."
         )
     else:
         st.error(
-            f"Exceeds datacenter power limit by "
+            f"Exceeds datacenter IT power limit by "
             f"{total_it_power_kw - max_it_power_kw:.1f} kW."
         )
 
@@ -657,24 +729,58 @@ with col3:
     )
     st.caption("Sum of leaf, spine, and core switches across all networks.")
 
-st.subheader("Rack allocation by function")
+st.subheader("Rack allocation by function (space and power constrained)")
 st.write(
-    f"- GPU racks: **{gpu_racks}** (GPU nodes only)\n"
-    f"- Storage racks: **{storage_racks}** (storage nodes only)\n"
-    f"- Management racks: **{mgmt_racks}** (management nodes only)\n"
-    f"- Network racks: **{network_racks}** (all network switches)\n"
+    f"- GPU racks: **{gpu_racks}** "
+    f"(nodes per rack: {gpu_nodes_per_rack} | U-cap: {gpu_cap_by_u}, "
+    f"power-cap: {gpu_cap_by_pwr})\n"
+    f"- Storage racks: **{storage_racks}** "
+    f"(nodes per rack: {storage_nodes_per_rack} | U-cap: {storage_cap_by_u}, "
+    f"power-cap: {storage_cap_by_pwr})\n"
+    f"- Management racks: **{mgmt_racks}** "
+    f"(nodes per rack: {mgmt_nodes_per_rack} | U-cap: {mgmt_cap_by_u}, "
+    f"power-cap: {mgmt_cap_by_pwr})\n"
+    f"- Network racks: **{network_racks}** "
+    f"(switches per rack: {switches_per_rack} | U-cap: {sw_cap_by_u}, "
+    f"power-cap: {sw_cap_by_pwr})\n"
 )
+
+# Warnings if a node type does not fit within per-rack power
+if gpu_nodes_per_rack == 0 and num_gpu_nodes > 0:
+    st.warning(
+        "GPU node power exceeds the maximum rack power or rack U capacity; "
+        "no valid packing exists for GPU racks with current constraints."
+    )
+if storage_nodes_per_rack == 0 and num_storage_nodes > 0:
+    st.warning(
+        "Storage node power exceeds the maximum rack power or rack U capacity; "
+        "no valid packing exists for storage racks with current constraints."
+    )
+if mgmt_nodes_per_rack == 0 and num_mgmt_nodes > 0:
+    st.warning(
+        "Management node power exceeds the maximum rack power or rack U capacity; "
+        "no valid packing exists for management racks with current constraints."
+    )
+if switches_per_rack == 0 and total_switches > 0:
+    st.warning(
+        "Switch power exceeds the maximum rack power or rack U capacity; "
+        "no valid packing exists for network racks with current constraints."
+    )
 
 st.subheader("Power breakdown (kW)")
 st.write(
-    f"- GPU nodes: **{total_gpu_power_kw:.1f} kW** "
+    f"- GPU nodes (including GPUs, CPUs, NICs, etc.): "
+    f"**{total_gpu_power_kw:.1f} kW** "
     f"({num_gpu_nodes} nodes @ {gpu_node_power_kw:.1f} kW each)\n"
     f"- Storage nodes: **{total_storage_power_kw:.1f} kW** "
     f"({num_storage_nodes} nodes @ {storage_node_power_kw:.1f} kW each)\n"
     f"- Management nodes: **{total_mgmt_power_kw:.1f} kW** "
     f"({num_mgmt_nodes} nodes @ {mgmt_node_power_kw:.1f} kW each)\n"
-    f"- Network switches: **{total_switch_power_kw:.1f} kW** "
+    f"- Network switches (incl. switch-side NICs/ports): "
+    f"**{total_switch_power_kw:.1f} kW** "
     f"({total_switches} switches @ {switch_power_kw:.1f} kW each)\n"
+    f"- **Total IT load:** **{total_it_power_kw:.1f} kW** "
+    f"(compared to datacenter limit {max_it_power_kw:.1f} kW)\n"
 )
 
 # ------------------------------
@@ -739,7 +845,7 @@ with col_mgmt:
     )
 
 st.info(
-    "Note: The switch counts and diagrams are **sizing approximations** based on "
-    "port counts and oversubscription ratios. They are intended as a planning aid, "
-    "not as a fully constrained physical design."
+    "Note: The switch counts, rack allocations, and diagrams are **sizing approximations** based on "
+    "port counts, oversubscription ratios, rack U, and per-rack power limits. They are intended as "
+    "a planning aid, not as a fully constrained physical design."
 )
