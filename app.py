@@ -311,7 +311,7 @@ st.sidebar.subheader("Node counts")
 num_gpu_nodes = st.sidebar.number_input(
     "Number of GPU compute nodes",
     min_value=0,
-    value=32,
+    value=64,
     step=1,
 )
 num_storage_nodes = st.sidebar.number_input(
@@ -356,14 +356,14 @@ st.sidebar.header("Datacenter constraints")
 max_it_power_kw = st.sidebar.number_input(
     "Datacenter IT power limit (kW)",
     min_value=10.0,
-    value=1000.0,
+    value=2000.0,
     step=10.0,
 )
 
 max_racks = st.sidebar.number_input(
     "Datacenter rack count limit",
     min_value=1,
-    value=40,
+    value=56,
     step=1,
 )
 
